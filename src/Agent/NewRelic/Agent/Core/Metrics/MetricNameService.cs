@@ -25,17 +25,17 @@ namespace NewRelic.Agent.Core.Metrics
 
         public string NormalizeUrl(string url)
         {
-            ITimer timer = new Timer();
-            try
+            url = StripParameters(url);
+            if (TryRenameUsingRegexRules(url, _configuration.UrlRegexRules, out string result))
             {
-                url = StripParameters(url);
-                url = RenameUsingRegexRules(url, _configuration.UrlRegexRules);
-
-                return url;
+                return result;
             }
-            finally
+            else
             {
-                timer.Stop();
+                // This is currently a placeholder until a decision is made on
+                // whether or not the pre-existing behavior of bubbling up an
+                // exception is actually desired.
+                return result;
             }
         }
 
@@ -50,18 +50,16 @@ namespace NewRelic.Agent.Core.Metrics
 
         public TransactionMetricName RenameTransaction(TransactionMetricName proposedTransactionName)
         {
-            var shouldIgnore = false;
-            string newPrefixedTransactionName;
-            try
+            var shouldIgnore = true;
+
+            if (TryRenameUsingRegexRules(proposedTransactionName.PrefixedName, _configuration.TransactionNameRegexRules, out string newPrefixedTransactionName))
             {
-                newPrefixedTransactionName = RenameUsingRegexRules(proposedTransactionName.PrefixedName, _configuration.TransactionNameRegexRules);
                 newPrefixedTransactionName = RenameUsingWhitelistRules(newPrefixedTransactionName, _configuration.TransactionNameWhitelistRules);
             }
-            catch (IgnoreTransactionException ex)
+            else
             {
-                Log.Debug(ex.Message);
                 shouldIgnore = true;
-                newPrefixedTransactionName = ex.IgnoredTransactionName;
+                newPrefixedTransactionName = proposedTransactionName.PrefixedName;
             }
 
             // Renaming rules are not allowed to change the first segment of a transaction name
@@ -73,16 +71,13 @@ namespace NewRelic.Agent.Core.Metrics
         public string RenameMetric(string metricName)
         {
             if (metricName == null)
+            {
                 return null;
+            }
 
-            try
-            {
-                return RenameUsingRegexRules(metricName, _configuration.MetricNameRegexRules);
-            }
-            catch (IgnoreTransactionException)
-            {
-                return null;
-            }
+            TryRenameUsingRegexRules(metricName, _configuration.MetricNameRegexRules, out string result);
+
+            return result;
         }
 
         #endregion Public API
@@ -121,27 +116,43 @@ namespace NewRelic.Agent.Core.Metrics
             return url;
         }
 
-        private static string RenameUsingRegexRules(string input, IEnumerable<RegexRule> rules)
+        private static bool TryRenameUsingRegexRules(string input, IEnumerable<RegexRule> rules, out string result)
         {
+            result = input;
+            bool success = true;
+
             foreach (var rule in rules.OrderBy(rule => rule.EvaluationOrder))
             {
-                var ruleResult = rule.ApplyTo(input);
+                var ruleResult = rule.ApplyTo(result);
                 if (!ruleResult.IsMatch)
+                {
                     continue;
+                }
+                else if (rule.Ignore)
+                {
+                    Log.DebugFormat($"Ignoring \"{input}\" because it matched pattern \"{rule.MatchExpression}\"");
+                    result = null;
+                    return false;
+                }
+                else if (ruleResult.Replacement == null)
+                {
+                    Log.Error("RuleResult matched but returned null replacement string");
+                    result = null;
+                    return false;
+                }
 
-                if (rule.Ignore)
-                    throw new IgnoreTransactionException($"Ignoring \"{input}\" because it matched pattern \"{rule.MatchExpression}\"", input);
-
-                if (ruleResult.Replacement == null)
-                    throw new Exception("RuleResult matched but returned null replacement string");
-
-                input = ruleResult.Replacement;
+                result = ruleResult.Replacement;
 
                 if (rule.TerminateChain)
+                {
                     break;
+                }
             }
 
-            return input;
+            return success;
+
+
+
         }
 
         private static string RenameUsingWhitelistRules(string metricName, IDictionary<string, IEnumerable<string>> whitelistRules)
